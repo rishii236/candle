@@ -1,0 +1,527 @@
+const express = require('express');
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const morgan = require('morgan');
+const { body, validationResult } = require('express-validator');
+require('dotenv').config();
+
+const app = express();
+
+// Security middleware
+app.use(helmet());
+app.use(morgan('combined'));
+
+// Rate limiting
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // limit each IP to 5 requests per windowMs
+  message: {
+    message: 'Too many authentication attempts, please try again later.'
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// CORS configuration
+const corsOptions = {
+  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  credentials: true,
+  optionsSuccessStatus: 200
+};
+
+app.use(cors(corsOptions));
+app.use(express.json({ limit: '10mb' }));
+app.use(generalLimiter);
+
+// MongoDB Connection with better error handling
+mongoose.connect(process.env.MONGODB_URI || 'mongodb+srv://your-username:your-password@cluster0.mongodb.net/candle?retryWrites=true&w=majority', {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+})
+.then(() => {
+  console.log('✅ Connected to MongoDB Atlas');
+})
+.catch((error) => {
+  console.error('❌ MongoDB connection error:', error);
+  process.exit(1);
+});
+
+// User Schema
+const userSchema = new mongoose.Schema({
+  username: {
+    type: String,
+    required: true,
+    unique: true,
+    trim: true,
+    minlength: 3,
+    maxlength: 20
+  },
+  email: {
+    type: String,
+    required: true,
+    unique: true,
+    trim: true,
+    lowercase: true
+  },
+  password: {
+    type: String,
+    required: true,
+    minlength: 6
+  },
+  fullName: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  avatar: {
+    type: String,
+    default: ''
+  },
+  stats: {
+    currentStreak: { type: Number, default: 0 },
+    totalPoints: { type: Number, default: 0 },
+    globalRank: { type: Number, default: null },
+    accuracyRate: { type: Number, default: 0 },
+    totalPredictions: { type: Number, default: 0 },
+    correctPredictions: { type: Number, default: 0 }
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now
+  },
+  lastLogin: {
+    type: Date,
+    default: Date.now
+  },
+  isActive: {
+    type: Boolean,
+    default: true
+  }
+});
+
+// Add indexes for better performance
+userSchema.index({ email: 1 });
+userSchema.index({ username: 1 });
+userSchema.index({ 'stats.globalRank': 1 });
+
+const User = mongoose.model('User', userSchema);
+
+// Prediction Schema
+const predictionSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  company: { type: String, required: true },
+  ticker: { type: String, required: true },
+  prediction: { type: String, required: true, enum: ['Beat', 'Meet', 'Miss'] },
+  confidence: { type: Number, min: 1, max: 5, default: 3 },
+  actualResult: { type: String, enum: ['Beat', 'Meet', 'Miss'] },
+  points: { type: Number, default: 0 },
+  status: { type: String, default: 'pending', enum: ['pending', 'correct', 'wrong'] },
+  createdAt: { type: Date, default: Date.now },
+  earnDate: { type: Date, required: true },
+  quarter: { type: String, required: true },
+  year: { type: Number, required: true }
+});
+
+predictionSchema.index({ userId: 1, createdAt: -1 });
+predictionSchema.index({ earnDate: 1 });
+predictionSchema.index({ status: 1 });
+
+const Prediction = mongoose.model('Prediction', predictionSchema);
+
+// Middleware to verify JWT token
+const authenticateToken = async (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ message: 'Access token required' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const user = await User.findById(decoded.userId);
+    
+    if (!user || !user.isActive) {
+      return res.status(404).json({ message: 'User not found or inactive' });
+    }
+    
+    req.user = user;
+    next();
+  } catch (error) {
+    if (error.name === 'TokenExpiredError') {
+      return res.status(401).json({ message: 'Token expired' });
+    }
+    return res.status(403).json({ message: 'Invalid token' });
+  }
+};
+
+// Validation middleware
+const validateRegistration = [
+  body('username')
+    .isLength({ min: 3, max: 20 })
+    .matches(/^[a-zA-Z0-9_]+$/)
+    .withMessage('Username must be 3-20 characters and contain only letters, numbers, and underscores'),
+  body('email')
+    .isEmail()
+    .normalizeEmail()
+    .withMessage('Please provide a valid email'),
+  body('password')
+    .isLength({ min: 6 })
+    .withMessage('Password must be at least 6 characters'),
+  body('fullName')
+    .isLength({ min: 2, max: 50 })
+    .trim()
+    .withMessage('Full name must be 2-50 characters')
+];
+
+const validateLogin = [
+  body('emailOrUsername')
+    .notEmpty()
+    .withMessage('Email or username is required'),
+  body('password')
+    .notEmpty()
+    .withMessage('Password is required')
+];
+
+// Helper function to handle validation errors
+const handleValidationErrors = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({
+      message: 'Validation failed',
+      errors: errors.array()
+    });
+  }
+  next();
+};
+
+// Routes
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    environment: process.env.NODE_ENV || 'development'
+  });
+});
+
+// Register with validation
+app.post('/api/auth/register', authLimiter, validateRegistration, handleValidationErrors, async (req, res) => {
+  try {
+    const { username, email, password, fullName } = req.body;
+
+    // Check if user already exists
+    const existingUser = await User.findOne({
+      $or: [{ email }, { username }]
+    });
+
+    if (existingUser) {
+      return res.status(400).json({ 
+        message: existingUser.email === email ? 'Email already exists' : 'Username already taken' 
+      });
+    }
+
+    // Hash password with higher salt rounds
+    const saltRounds = 12;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+
+    // Create user
+    const user = new User({
+      username,
+      email,
+      password: hashedPassword,
+      fullName
+    });
+
+    await user.save();
+
+    // Generate token
+    const token = jwt.sign(
+      { userId: user._id, username: user.username },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: '7d' }
+    );
+
+    // Log successful registration
+    console.log(`✅ New user registered: ${username} (${email})`);
+
+    res.status(201).json({
+      message: 'User created successfully',
+      token,
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        fullName: user.fullName,
+        stats: user.stats,
+        createdAt: user.createdAt
+      }
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    
+    if (error.code === 11000) {
+      const field = Object.keys(error.keyPattern)[0];
+      return res.status(400).json({ 
+        message: `${field.charAt(0).toUpperCase() + field.slice(1)} already exists` 
+      });
+    }
+    
+    res.status(500).json({ message: 'Server error during registration' });
+  }
+});
+
+// Login with validation
+app.post('/api/auth/login', authLimiter, validateLogin, handleValidationErrors, async (req, res) => {
+  try {
+    const { emailOrUsername, password } = req.body;
+
+    // Find user by email or username
+    const user = await User.findOne({
+      $or: [
+        { email: emailOrUsername.toLowerCase() },
+        { username: emailOrUsername }
+      ],
+      isActive: true
+    });
+
+    if (!user) {
+      return res.status(400).json({ message: 'Invalid credentials' });
+    }
+
+    // Check password
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(400).json({ message: 'Invalid credentials' });
+    }
+
+    // Update last login
+    user.lastLogin = new Date();
+    await user.save();
+
+    // Generate token
+    const token = jwt.sign(
+      { userId: user._id, username: user.username },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: '7d' }
+    );
+
+    // Log successful login
+    console.log(`✅ User logged in: ${user.username}`);
+
+    res.json({
+      message: 'Login successful',
+      token,
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        fullName: user.fullName,
+        stats: user.stats,
+        lastLogin: user.lastLogin
+      }
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ message: 'Server error during login' });
+  }
+});
+
+// Get current user
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+  try {
+    res.json({
+      user: {
+        id: req.user._id,
+        username: req.user.username,
+        email: req.user.email,
+        fullName: req.user.fullName,
+        stats: req.user.stats,
+        avatar: req.user.avatar,
+        createdAt: req.user.createdAt,
+        lastLogin: req.user.lastLogin
+      }
+    });
+  } catch (error) {
+    console.error('Get user error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Update user profile
+app.put('/api/auth/profile', authenticateToken, [
+  body('fullName').optional().isLength({ min: 2, max: 50 }).trim(),
+  body('avatar').optional().isURL().withMessage('Avatar must be a valid URL')
+], handleValidationErrors, async (req, res) => {
+  try {
+    const { fullName, avatar } = req.body;
+    
+    if (fullName) req.user.fullName = fullName;
+    if (avatar !== undefined) req.user.avatar = avatar;
+    
+    await req.user.save();
+    
+    res.json({
+      message: 'Profile updated successfully',
+      user: {
+        id: req.user._id,
+        username: req.user.username,
+        email: req.user.email,
+        fullName: req.user.fullName,
+        stats: req.user.stats,
+        avatar: req.user.avatar
+      }
+    });
+  } catch (error) {
+    console.error('Profile update error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get user predictions with pagination
+app.get('/api/predictions', authenticateToken, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 10, 50); // Max 50 per page
+    const skip = (page - 1) * limit;
+
+    const predictions = await Prediction.find({ userId: req.user._id })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
+    
+    const total = await Prediction.countDocuments({ userId: req.user._id });
+    
+    res.json({ 
+      predictions,
+      pagination: {
+        current: page,
+        total: Math.ceil(total / limit),
+        count: predictions.length,
+        totalRecords: total
+      }
+    });
+  } catch (error) {
+    console.error('Get predictions error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Create prediction with validation
+app.post('/api/predictions', authenticateToken, [
+  body('company').notEmpty().withMessage('Company name is required'),
+  body('ticker').notEmpty().matches(/^[A-Z]{1,5}$/).withMessage('Ticker must be 1-5 uppercase letters'),
+  body('prediction').isIn(['Beat', 'Meet', 'Miss']).withMessage('Prediction must be Beat, Meet, or Miss'),
+  body('earnDate').isISO8601().withMessage('Earnings date must be a valid date'),
+  body('confidence').optional().isInt({ min: 1, max: 5 }).withMessage('Confidence must be 1-5'),
+  body('quarter').matches(/^Q[1-4]$/).withMessage('Quarter must be Q1, Q2, Q3, or Q4'),
+  body('year').isInt({ min: 2020, max: 2030 }).withMessage('Year must be between 2020-2030')
+], handleValidationErrors, async (req, res) => {
+  try {
+    const { company, ticker, prediction, earnDate, confidence, quarter, year } = req.body;
+    
+    // Check if user already has a prediction for this company/quarter
+    const existingPrediction = await Prediction.findOne({
+      userId: req.user._id,
+      ticker: ticker.toUpperCase(),
+      quarter,
+      year
+    });
+    
+    if (existingPrediction) {
+      return res.status(400).json({ 
+        message: `You already have a prediction for ${ticker} ${quarter} ${year}` 
+      });
+    }
+    
+    const newPrediction = new Prediction({
+      userId: req.user._id,
+      company,
+      ticker: ticker.toUpperCase(),
+      prediction,
+      earnDate: new Date(earnDate),
+      confidence: confidence || 3,
+      quarter,
+      year
+    });
+    
+    await newPrediction.save();
+    
+    // Update user stats
+    req.user.stats.totalPredictions += 1;
+    await req.user.save();
+    
+    console.log(`📊 New prediction: ${req.user.username} - ${ticker} ${prediction}`);
+    
+    res.status(201).json({
+      message: 'Prediction created successfully',
+      prediction: newPrediction
+    });
+  } catch (error) {
+    console.error('Create prediction error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get leaderboard
+app.get('/api/leaderboard', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 100, 100);
+    
+    const topUsers = await User.find(
+      { isActive: true, 'stats.totalPredictions': { $gt: 0 } },
+      { username: 1, fullName: 1, stats: 1, avatar: 1 }
+    )
+    .sort({ 'stats.totalPoints': -1, 'stats.accuracyRate': -1 })
+    .limit(limit);
+    
+    res.json({ leaderboard: topUsers });
+  } catch (error) {
+    console.error('Leaderboard error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ message: 'Something went wrong!' });
+});
+
+// Handle 404 routes
+app.use('*', (req, res) => {
+  res.status(404).json({ message: 'Route not found' });
+});
+
+const PORT = process.env.PORT || 5000;
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  mongoose.connection.close(() => {
+    console.log('MongoDB connection closed');
+    process.exit(0);
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
+  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🔒 CORS enabled for: ${process.env.FRONTEND_URL || 'http://localhost:5173'}`);
+});
+
+module.exports = app;
